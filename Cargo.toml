@@ -1,0 +1,10 @@
+[package]
+name = "ssdp-bridge"
+version = "0.1.0"
+authors = ["Will Donohoe <will@mcsi.mp>"]
+edition = "2018"
+
+[dependencies]
+tokio = { version = "0.2", features = ["full"] }
+roxmltree = "0.8.0"
+reqwest = "0.10.0"
