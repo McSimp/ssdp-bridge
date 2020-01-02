@@ -4,6 +4,7 @@ use std::collections::{HashSet, HashMap};
 use std::net::{SocketAddrV4, Ipv4Addr};
 use std::iter::FromIterator;
 use tokio::net::UdpSocket;
+use chrono::Utc;
 
 // NOTE: This only supports UPnP 1.0
 const CACHE_CONTROL: &'static str = "max-age=1800";
@@ -142,7 +143,7 @@ struct SsdpSearchRequest<'a> {
     st: &'a str
 }
 
-fn process_ssdp_packet(buf: &[u8]) -> Result<SsdpSearchRequest, Box<dyn Error>> {
+fn parse_ssdp_packet(buf: &[u8]) -> Result<SsdpSearchRequest, Box<dyn Error>> {
     let data = std::str::from_utf8(buf)?;
     let headers = parse_search(data)?;
     println!("{:?}", headers);
@@ -169,6 +170,26 @@ fn process_ssdp_packet(buf: &[u8]) -> Result<SsdpSearchRequest, Box<dyn Error>> 
         mx,
         st
     })
+}
+
+fn build_search_response(location: &str, server: &str, st: &str, uuid: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         CACHE-CONTROL: {}\r\n\
+         DATE: {}\r\n\
+         EXT:\r\n\
+         LOCATION: {}\r\n\
+         SERVER: {}\r\n\
+         ST: {}\r\n\
+         USN: {}\r\n\
+         \r\n",
+        CACHE_CONTROL,
+        Utc::now().format("%a, %d %b %Y %T GMT"), // NOTE: Cannot use %Z since it produces UTC rather than GMT, which is not compliant with the standard
+        location,
+        server,
+        st,
+        build_usn(uuid, st)
+    )
 }
 
 #[tokio::main]
@@ -229,11 +250,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf: Vec<u8> = vec![0; 1024];
     loop {
         let (size, src) = socket.recv_from(&mut buf).await?;
-        println!("{:?}", std::str::from_utf8(&buf[..size]).unwrap());
-        if let Ok(request) = process_ssdp_packet(&buf[..size]) {
+        if let Ok(request) = parse_ssdp_packet(&buf[..size]) {
+            println!("{:?}", src);
             println!("Got valid request! {:?} {:?}", request.st, request.mx);
+            if search_targets.contains(request.st) {
+                let response = build_search_response(url, &server_header, request.st, &upnp_device.uuid);
+                println!("{:?}", response);
+                socket.send_to(response.as_bytes(), src).await?;
+            } else if request.st == "ssdp:all" {
+                for st in &search_targets {
+                    let response = build_search_response(url, &server_header, st, &upnp_device.uuid);
+                    println!("{:?}", response);
+                    socket.send_to(response.as_bytes(), src).await?;
+                }
+            }
         }
     }
-    
+
+    // TODO: Respect proper delays as specified in the specification
+    // TODO: Properly support backwards compatibility with versions
+
     Ok(())
 }
