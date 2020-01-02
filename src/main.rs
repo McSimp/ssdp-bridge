@@ -1,10 +1,14 @@
 use clap::{Arg, App, crate_version, crate_authors, crate_description};
 use std::error::Error;
 use std::collections::{HashSet, HashMap};
-use std::net::{SocketAddrV4, Ipv4Addr};
+use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr, ToSocketAddrs};
 use std::iter::FromIterator;
-use tokio::net::UdpSocket;
+use tokio::net::{UdpSocket, TcpListener, TcpStream};
 use chrono::Utc;
+use url::Url;
+use tokio::io;
+use futures::future::try_join;
+use futures::FutureExt;
 
 // NOTE: This only supports UPnP 1.0
 const CACHE_CONTROL: &'static str = "max-age=1800";
@@ -12,6 +16,7 @@ const DEFAULT_BIND_IP: &'static str = "0.0.0.0";
 const MULTICAST_IP: &'static str = "239.255.255.250";
 const SSDP_PORT: u16 = 1900;
 const MULTICAST_ADDR: &'static str = "239.255.255.250:1900";
+const DEFAULT_PROXY_PORT: &'static str = "0";
 
 struct UpnpRootDevice {
     uuid: String,
@@ -192,6 +197,20 @@ fn build_search_response(location: &str, server: &str, st: &str, uuid: &str) -> 
     )
 }
 
+async fn transfer(mut inbound: TcpStream, proxy_addr: SocketAddr) -> Result<(), Box<dyn Error>> {
+    let mut outbound = TcpStream::connect(proxy_addr).await?;
+
+    let (mut ri, mut wi) = inbound.split();
+    let (mut ro, mut wo) = outbound.split();
+
+    let client_to_server = io::copy(&mut ri, &mut wo);
+    let server_to_client = io::copy(&mut ro, &mut wi);
+
+    try_join(client_to_server, server_to_client).await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = App::new("SSDP Bridge")
@@ -212,17 +231,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .takes_value(true)
             .required(true)
             .help("URL for UPnP description of remote root device"))
+        .arg(Arg::with_name("proxy_port")
+            .short("p")
+            .long("proxy-port")
+            .value_name("PORT")
+            .takes_value(true)
+            .default_value(DEFAULT_PROXY_PORT)
+            .help("TCP port the proxy listens on (set to 0 to choose automatically)"))
         .get_matches();
 
-    let bind_addr = SocketAddrV4::new(
-        matches.value_of("ip")
-            .unwrap()
-            .parse::<Ipv4Addr>()
-            .expect("Invalid bind IP address"),
-        SSDP_PORT
-    );
+    let bind_ip = matches.value_of("ip")
+        .unwrap()
+        .parse::<Ipv4Addr>()?;
 
-    let url = matches.value_of("url").unwrap();
+    let proxy_port = matches.value_of("proxy_port")
+        .unwrap()
+        .parse::<u16>()?;
+
+    let mut parsed_url = Url::parse(matches.value_of("url").unwrap())?;
+
+    // Setup TCP proxy
+    let proxy_bind_addr = SocketAddrV4::new(bind_ip, proxy_port);
+    let target_port = parsed_url.port_or_known_default().ok_or("unknown port in remote URL")?;
+    let target_addr = (parsed_url.host_str().ok_or("no host in remote URL")?, target_port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or("no address could be found for remote URL")?;
+    
+    let mut listener = TcpListener::bind(proxy_bind_addr).await?;
+    let actual_proxy_addr = listener.local_addr()?;
+
+    println!("Listening on: {}", actual_proxy_addr);
+    println!("Proxying to: {}", target_addr);
+
+    parsed_url.set_ip_host(actual_proxy_addr.ip());
+    parsed_url.set_port(Some(actual_proxy_addr.port()));
+    println!("Reported location: {}", parsed_url.as_str());
+
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            let transfer = transfer(inbound, target_addr.clone()).map(|r| {
+                if let Err(e) = r {
+                    println!("Failed to transfer; error={}", e);
+                }
+            });
+
+            tokio::spawn(transfer);
+        }
+    });
+
+    // Setup SSDP responder
+    let ssdp_bind_addr = SocketAddrV4::new(bind_ip, SSDP_PORT);
+    let url = parsed_url.as_str();
     let server_header = build_server_header();
     
     // Grab device description from remote URL
@@ -237,7 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Setup multicast socket
     let multi: SocketAddrV4 = MULTICAST_ADDR.parse()?;
-    let mut socket = create_multicast_socket(&bind_addr, &multi)?;
+    let mut socket = create_multicast_socket(&ssdp_bind_addr, &multi)?;
 
     // Send out NOTIFY messages for each search target
     for st in &search_targets {
@@ -269,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // TODO: Respect proper delays as specified in the specification
     // TODO: Properly support backwards compatibility with versions
+    // NOTE: Windows will not connect to a Location outside local subnet it seems, so that's why a proxy is needed
 
     Ok(())
 }
