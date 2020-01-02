@@ -8,3 +8,6 @@ edition = "2018"
 tokio = { version = "0.2", features = ["full"] }
 roxmltree = "0.8.0"
 reqwest = "0.10.0"
+os_info = "1.2.0"
+socket2 = "0.3.11"
+clap = "2.33.0"
