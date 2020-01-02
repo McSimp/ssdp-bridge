@@ -1,15 +1,16 @@
 use clap::{Arg, App, crate_version, crate_authors, crate_description};
 use std::error::Error;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::net::{SocketAddrV4, Ipv4Addr};
 use std::iter::FromIterator;
 use tokio::net::UdpSocket;
 
 // NOTE: This only supports UPnP 1.0
-static CACHE_CONTROL: &str = "max-age=1800";
-static DEFAULT_BIND_IP: &str = "0.0.0.0";
-static MULTICAST_ADDR: &str = "239.255.255.250:1900";
+const CACHE_CONTROL: &'static str = "max-age=1800";
+const DEFAULT_BIND_IP: &'static str = "0.0.0.0";
+const MULTICAST_IP: &'static str = "239.255.255.250";
 const SSDP_PORT: u16 = 1900;
+const MULTICAST_ADDR: &'static str = "239.255.255.250:1900";
 
 struct UpnpRootDevice {
     uuid: String,
@@ -115,6 +116,61 @@ fn create_multicast_socket(bind_addr: &SocketAddrV4, multicast_addr: &SocketAddr
     UdpSocket::from_std(socket.into_udp_socket())
 }
 
+fn parse_search(data: &str) -> Result<HashMap<String, &str>, Box<dyn Error>> {
+    let mut lines = data.lines();
+    let mut headers: HashMap<String, &str> = HashMap::new();
+
+    // Ensure it looks like an M-SEARCH request
+    if lines.next().ok_or("missing first line")? != "M-SEARCH * HTTP/1.1" {
+        return Err("not an M-SEARCH request".into());
+    }
+
+    // Parse all the subsequent lines as headers
+    for line in lines {
+        if let Some(colon_pos) = line.find(":") {
+            let header_name = line[..colon_pos].trim().to_ascii_uppercase();
+            let header_value = line[colon_pos+1..].trim();
+            headers.insert(header_name, header_value);
+        }
+    }
+
+    Ok(headers)
+}
+
+struct SsdpSearchRequest<'a> {
+    mx: Option<u8>,
+    st: &'a str
+}
+
+fn process_ssdp_packet(buf: &[u8]) -> Result<SsdpSearchRequest, Box<dyn Error>> {
+    let data = std::str::from_utf8(buf)?;
+    let headers = parse_search(data)?;
+    println!("{:?}", headers);
+
+    // Check the HOST header is what we expect
+    let host = headers.get("HOST").ok_or("missing HOST header")?;
+    if *host != MULTICAST_IP && *host != MULTICAST_ADDR {
+        return Err("invaild HOST header".into());
+    }
+
+    // Check the MAN header is what we expect
+    let man = headers.get("MAN").ok_or("missing MAN header")?;
+    if *man != "\"ssdp:discover\"" {
+        return Err("invaild MAN header".into());
+    }
+    
+    // Grab the ST header
+    let st = headers.get("ST").ok_or("missing ST header")?;
+
+    // Grab the MX value as an integer if possible
+    let mx = headers.get("MX").and_then(|v| v.parse::<u8>().ok());
+
+    Ok(SsdpSearchRequest {
+        mx,
+        st
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = App::new("SSDP Bridge")
@@ -174,7 +230,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (size, src) = socket.recv_from(&mut buf).await?;
         println!("{:?}", std::str::from_utf8(&buf[..size]).unwrap());
-        println!("{:?}", src);
+        if let Ok(request) = process_ssdp_packet(&buf[..size]) {
+            println!("Got valid request! {:?} {:?}", request.st, request.mx);
+        }
     }
     
     Ok(())
